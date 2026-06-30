@@ -1,0 +1,489 @@
+# =====================================================================
+# TAPE Performance Indicators Calculator
+# =====================================================================
+# Tool for Agroecology Performance Evaluation (TAPE) - FAO
+# Computes additional Step 3 sustainability performance indicators
+# from KoboToolbox survey data exported as a flat CSV / data frame.
+#
+# Indicators computed:
+#   1. FIES  - Food Insecurity Experience Scale
+#   2. HDDS  - Household Dietary Diversity Score
+#   3. WDDS  - Women's Dietary Diversity Score (if columns present)
+#   4. Gini-Simpson Diversity Index (crop / species richness)
+#   5. Soil Health Score
+#   6. Economic Perception Score
+#   7. Land Tenure Score
+#   8. AWEAI - Agricultural Women's Empowerment Agri-Indicator
+#   9. Youth Score
+#
+# Author: Generated from TAPE KoboToolbox XLSForm v2025
+# Reference: FAO TAPE Manual (agroecology.fao.org)
+# =====================================================================
+# USAGE:
+#   source("tape_caet_indicators.R")        # load CAET functions first
+#   source("tape_performance_indicators.R")
+#   df_raw    <- read.csv("tape_export.csv", stringsAsFactors = FALSE)
+#   df_scored <- compute_caet(df_raw)
+#   df_scored <- compute_tape_performance(df_scored)
+#   write.csv(df_scored, "tape_all_indicators.csv", row.names = FALSE)
+# =====================================================================
+
+library(dplyr)
+library(tidyr)
+
+# Shared helpers (safe even if tape_caet_indicators.R was not sourced first)
+if (!exists("as_num")) as_num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+if (!exists("r2"))     r2     <- function(x) round(x, 2)
+
+# =====================================================================
+# 1. FIES  —  Food Insecurity Experience Scale
+# =====================================================================
+# Standard FAO 8-item module. Each item is binary (1 = Yes, 0 = No).
+#
+# KoboToolbox column names (adjust to your form if different):
+#   fies_worried   — Worried about not having enough food
+#   fies_healthy   — Unable to eat healthy / nutritious food
+#   fies_fewfood   — Ate only a few kinds of food
+#   fies_skipped   — Skipped a meal
+#   fies_ateless   — Ate less than thought should
+#   fies_ranout    — Ran out of food
+#   fies_hungry    — Was hungry but did not eat
+#   fies_whlday    — Went without eating for a whole day
+#
+# Outputs:
+#   fies_raw       integer  0–8  raw count of "Yes" responses
+#   fies_score     numeric  0–100  (fies_raw / 8) * 100
+#   fies_mild      integer  1 if fies_raw >= 1
+#   fies_moderate  integer  1 if fies_raw >= 3
+#   fies_severe    integer  1 if fies_raw >= 6
+
+compute_fies <- function(df) {
+
+  fies_items <- c("fies_worried", "fies_healthy", "fies_fewfood", "fies_skipped",
+                  "fies_ateless", "fies_ranout",  "fies_hungry",  "fies_whlday")
+
+  mat <- vapply(fies_items, function(col) {
+    if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, nrow(df))
+  }, numeric(nrow(df)))
+
+  fies_raw <- rowSums(mat, na.rm = FALSE)
+
+  df[["fies_raw"]]      <- fies_raw
+  df[["fies_score"]]    <- r2((fies_raw / 8L) * 100)
+  df[["fies_mild"]]     <- as.integer(!is.na(fies_raw) & fies_raw >= 1)
+  df[["fies_moderate"]] <- as.integer(!is.na(fies_raw) & fies_raw >= 3)
+  df[["fies_severe"]]   <- as.integer(!is.na(fies_raw) & fies_raw >= 6)
+
+  df
+}
+
+# =====================================================================
+# 2. HDDS  —  Household Dietary Diversity Score
+# =====================================================================
+# 12 food-group binary variables (1 = consumed in last 24 h, 0 = not).
+#
+# KoboToolbox column names:
+#   dd_cereals, dd_roots, dd_vegetables, dd_fruits,
+#   dd_meat, dd_eggs, dd_fish, dd_legumes,
+#   dd_dairy, dd_oils, dd_sweets, dd_condiments
+#
+# Outputs:
+#   hdds        integer  0–12
+#   hdds_score  numeric  0–100  (hdds / 12) * 100
+#
+# Women's DDS (WDDS) is computed automatically if columns prefixed
+# with "w_" exist (e.g. w_dd_cereals, w_dd_meat, …).
+
+compute_dietary_diversity <- function(df) {
+
+  dd_groups <- c("dd_cereals", "dd_roots",    "dd_vegetables", "dd_fruits",
+                 "dd_meat",    "dd_eggs",     "dd_fish",       "dd_legumes",
+                 "dd_dairy",   "dd_oils",     "dd_sweets",     "dd_condiments")
+
+  mat_hh <- vapply(dd_groups, function(col) {
+    if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, nrow(df))
+  }, numeric(nrow(df)))
+
+  hdds <- rowSums(mat_hh, na.rm = FALSE)
+  df[["hdds"]]       <- hdds
+  df[["hdds_score"]] <- r2((hdds / 12L) * 100)
+
+  # WDDS — women-specific columns (w_dd_*)
+  wdd_groups <- paste0("w_", dd_groups)
+  if (any(wdd_groups %in% names(df))) {
+    mat_w <- vapply(wdd_groups, function(col) {
+      if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, nrow(df))
+    }, numeric(nrow(df)))
+    wdds <- rowSums(mat_w, na.rm = FALSE)
+    df[["wdds"]]       <- wdds
+    df[["wdds_score"]] <- r2((wdds / 12L) * 100)
+  }
+
+  df
+}
+
+# =====================================================================
+# 3. Gini-Simpson Diversity Index
+# =====================================================================
+# GS = 1 - sum(p_i^2)   where p_i = proportion of each species / crop
+#
+# The index equals 0 for a monoculture and approaches 1 for high
+# evenness across many species.
+#
+# @param df          Data frame
+# @param col_prefix  Prefix shared by all species/crop columns
+#                    (default "crop_area_"). All matching columns are
+#                    used as abundance / area values.
+#
+# Outputs:
+#   gini_simpson        numeric  0–1
+#   gini_simpson_score  numeric  0–100
+
+compute_gini_simpson <- function(df, col_prefix = "crop_area_") {
+
+  species_cols <- names(df)[startsWith(names(df), col_prefix)]
+
+  if (length(species_cols) == 0L) {
+    warning(sprintf(
+      "No columns found with prefix '%s' — gini_simpson set to NA.", col_prefix))
+    df[["gini_simpson"]]       <- NA_real_
+    df[["gini_simpson_score"]] <- NA_real_
+    return(df)
+  }
+
+  counts <- vapply(species_cols, function(col) as_num(df[[col]]),
+                   numeric(nrow(df)))
+  if (is.null(dim(counts))) counts <- matrix(counts, ncol = 1)
+
+  row_totals <- rowSums(counts, na.rm = TRUE)
+  props      <- counts / row_totals
+  gs         <- 1 - rowSums(props^2, na.rm = TRUE)
+  gs         <- ifelse(row_totals == 0, NA_real_, gs)
+
+  df[["gini_simpson"]]       <- r2(gs)
+  df[["gini_simpson_score"]] <- r2(gs * 100)
+
+  df
+}
+
+# =====================================================================
+# 4. Soil Health Score
+# =====================================================================
+# Five ordinal items (0 / 0.5 / 1 / 1.5 / 2; higher = better):
+#   soil_organic_matter    — observed / estimated SOM level
+#   soil_erosion           — absence of erosion (inverted: 2 = no erosion)
+#   soil_compaction        — absence of compaction
+#   soil_water_retention   — water-holding capacity
+#   soil_biodiversity      — visible soil fauna / earthworms
+#
+# Outputs:
+#   soil_health_raw    numeric  0–10  (sum of available items)
+#   soil_health_score  numeric  0–100  (raw / max_possible) * 100
+
+compute_soil_health <- function(df) {
+
+  soil_items <- c("soil_organic_matter", "soil_erosion", "soil_compaction",
+                  "soil_water_retention", "soil_biodiversity")
+
+  mat <- vapply(soil_items, function(col) {
+    if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, nrow(df))
+  }, numeric(nrow(df)))
+
+  n_present     <- rowSums(!is.na(mat))
+  raw_sum       <- rowSums(mat, na.rm = TRUE)
+  max_possible  <- n_present * 2            # each item max = 2
+
+  df[["soil_health_raw"]]   <- raw_sum
+  df[["soil_health_score"]] <- r2(
+    ifelse(max_possible > 0, (raw_sum / max_possible) * 100, NA_real_)
+  )
+
+  df
+}
+
+# =====================================================================
+# 5. Economic Perception Score
+# =====================================================================
+# Three ordinal items (0 / 0.5 / 1 / 1.5 / 2):
+#   econ_situation   — household's current economic situation (0=bad, 2=good)
+#   econ_trend       — economic situation trend (0=worsening, 2=improving)
+#   econ_cover_needs — ability to cover basic household needs
+#
+# econ_perception_score = (sum / 6) * 100
+
+compute_economic_perception <- function(df) {
+
+  econ_items <- c("econ_situation", "econ_trend", "econ_cover_needs")
+
+  mat <- vapply(econ_items, function(col) {
+    if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, nrow(df))
+  }, numeric(nrow(df)))
+
+  econ_sum <- rowSums(mat, na.rm = FALSE)
+  df[["econ_perception_raw"]]   <- econ_sum
+  df[["econ_perception_score"]] <- r2((econ_sum / 6) * 100)
+
+  df
+}
+
+# =====================================================================
+# 6. Land Tenure Score
+# =====================================================================
+# Three ordinal items (0 / 0.5 / 1 / 1.5 / 2):
+#   tenure_security   — perceived security of land tenure
+#   tenure_formality  — formal documentation (title, contract, etc.)
+#   tenure_access     — ease of access / breadth of land rights
+#
+# land_tenure_score = (sum / 6) * 100
+
+compute_land_tenure <- function(df) {
+
+  tenure_items <- c("tenure_security", "tenure_formality", "tenure_access")
+
+  mat <- vapply(tenure_items, function(col) {
+    if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, nrow(df))
+  }, numeric(nrow(df)))
+
+  tenure_sum <- rowSums(mat, na.rm = FALSE)
+  df[["land_tenure_raw"]]   <- tenure_sum
+  df[["land_tenure_score"]] <- r2((tenure_sum / 6) * 100)
+
+  df
+}
+
+# =====================================================================
+# 7. AWEAI  —  Agricultural Women's Empowerment Agri-Indicator
+# =====================================================================
+# Based on FAO's Five Domains of Empowerment (5DE) framework.
+# All input items use the 0 / 0.5 / 1 / 1.5 / 2 ordinal scale.
+#
+# Domain 1 — Production Decisions (3 items, max = 6):
+#   decisions_input      — input/production decisions
+#   decisions_livestock  — livestock decisions  (0 if raise_animals = 0)
+#   decisions_food       — food-processing / marketing decisions
+#
+# Domain 2 — Resources & Technology (3 items, max = 6):
+#   access_land_w        — women's access to land
+#   access_credit_w      — women's access to credit
+#   access_tech_w        — women's access to technology / extension
+#
+# Domain 3 — Income Control (1 item, max = 2):
+#   control_income_w     — women's control over household income
+#
+# Domain 4 — Leadership (1 item, max = 2):
+#   leadership_community_w — participation in community/group leadership
+#
+# Domain 5 — Time / Workload Balance (1 item, max = 2):
+#   workload_balance_w   — perceived balance of productive + domestic work
+#
+# Adequacy threshold: domain score >= 80 %
+# A woman is EMPOWERED if adequate in >= 4 of 5 domains.
+#
+# Outputs (all per farm / respondent):
+#   aweai_d1_decisions   numeric 0–100
+#   aweai_d2_resources   numeric 0–100
+#   aweai_d3_income      numeric 0–100
+#   aweai_d4_leadership  numeric 0–100
+#   aweai_d5_time        numeric 0–100
+#   aweai_n_adequate     integer 0–5  (domains above threshold)
+#   aweai_empowered      integer 0/1
+#   aweai_score          numeric 0–100  (n_adequate / 5) * 100
+
+compute_aweai <- function(df) {
+
+  n <- nrow(df)
+
+  get_cols <- function(cols) {
+    vapply(cols, function(col) {
+      if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, n)
+    }, numeric(n))
+  }
+
+  domain_pct <- function(mat, max_score) {
+    if (is.null(dim(mat))) mat <- matrix(mat, ncol = 1L)
+    r2(rowSums(mat, na.rm = FALSE) / max_score * 100)
+  }
+
+  d1 <- domain_pct(get_cols(c("decisions_input", "decisions_livestock",
+                               "decisions_food")),  max_score = 6)
+  d2 <- domain_pct(get_cols(c("access_land_w", "access_credit_w",
+                               "access_tech_w")),   max_score = 6)
+  d3 <- domain_pct(get_cols("control_income_w"),    max_score = 2)
+  d4 <- domain_pct(get_cols("leadership_community_w"), max_score = 2)
+  d5 <- domain_pct(get_cols("workload_balance_w"),  max_score = 2)
+
+  adequate   <- cbind(d1 >= 80, d2 >= 80, d3 >= 80, d4 >= 80, d5 >= 80)
+  n_adequate <- rowSums(adequate, na.rm = TRUE)
+
+  df[["aweai_d1_decisions"]]   <- d1
+  df[["aweai_d2_resources"]]   <- d2
+  df[["aweai_d3_income"]]      <- d3
+  df[["aweai_d4_leadership"]]  <- d4
+  df[["aweai_d5_time"]]        <- d5
+  df[["aweai_n_adequate"]]     <- n_adequate
+  df[["aweai_empowered"]]      <- as.integer(n_adequate >= 4L)
+  df[["aweai_score"]]          <- r2((n_adequate / 5) * 100)
+
+  df
+}
+
+# =====================================================================
+# 8. Youth Score
+# =====================================================================
+# Four ordinal items (0 / 0.5 / 1 / 1.5 / 2):
+#   youth_involvement  — youth involvement in farm decision-making
+#   youth_succession   — succession planning that includes youth
+#   youth_training     — youth access to training / vocational education
+#   youth_access_land  — youth access to land / productive resources
+#
+# youth_score = (sum / 8) * 100
+# (denominator adjusts for missing items to keep comparability)
+
+compute_youth_score <- function(df) {
+
+  youth_items <- c("youth_involvement", "youth_succession",
+                   "youth_training",    "youth_access_land")
+
+  mat <- vapply(youth_items, function(col) {
+    if (col %in% names(df)) as_num(df[[col]]) else rep(NA_real_, nrow(df))
+  }, numeric(nrow(df)))
+
+  n_present  <- rowSums(!is.na(mat))
+  youth_sum  <- rowSums(mat, na.rm = FALSE)
+  max_poss   <- n_present * 2
+
+  df[["youth_raw"]]   <- youth_sum
+  df[["youth_score"]] <- r2(
+    ifelse(max_poss > 0, (youth_sum / max_poss) * 100, NA_real_)
+  )
+
+  df
+}
+
+# =====================================================================
+# MASTER FUNCTION  —  compute all TAPE performance indicators
+# =====================================================================
+#
+# @param df              Data frame (output of compute_caet() or raw data)
+# @param crop_col_prefix Column prefix for Gini-Simpson crop abundances
+#                        (set to NULL to skip Gini-Simpson)
+#
+# @return  Input data frame augmented with all indicator columns
+
+compute_tape_performance <- function(df, crop_col_prefix = "crop_area_") {
+
+  df <- as.data.frame(df)
+  df <- compute_fies(df)
+  df <- compute_dietary_diversity(df)
+  if (!is.null(crop_col_prefix))
+    df <- compute_gini_simpson(df, col_prefix = crop_col_prefix)
+  df <- compute_soil_health(df)
+  df <- compute_economic_perception(df)
+  df <- compute_land_tenure(df)
+  df <- compute_aweai(df)
+  df <- compute_youth_score(df)
+
+  df
+}
+
+# =====================================================================
+# CONVENIENCE  —  extract performance indicator summary
+# =====================================================================
+
+tape_performance_summary <- function(results, id_col = NULL) {
+
+  perf_cols <- c(
+    "fies_raw", "fies_score", "fies_mild", "fies_moderate", "fies_severe",
+    "hdds", "hdds_score", "wdds", "wdds_score",
+    "gini_simpson", "gini_simpson_score",
+    "soil_health_raw", "soil_health_score",
+    "econ_perception_raw", "econ_perception_score",
+    "land_tenure_raw", "land_tenure_score",
+    "aweai_d1_decisions", "aweai_d2_resources", "aweai_d3_income",
+    "aweai_d4_leadership", "aweai_d5_time",
+    "aweai_n_adequate", "aweai_empowered", "aweai_score",
+    "youth_raw", "youth_score"
+  )
+
+  # Keep only columns that exist in results
+  perf_cols <- intersect(perf_cols, names(results))
+
+  if (!is.null(id_col) && id_col %in% names(results)) {
+    out <- results[, c(id_col, perf_cols), drop = FALSE]
+  } else {
+    out <- results[, perf_cols, drop = FALSE]
+    out <- cbind(farm_id = seq_len(nrow(out)), out)
+  }
+
+  out
+}
+
+# =====================================================================
+# VALIDATION CHECKS
+# =====================================================================
+
+validate_performance_data <- function(df) {
+
+  expected <- list(
+    fies    = c("fies_worried", "fies_healthy", "fies_fewfood", "fies_skipped",
+                "fies_ateless", "fies_ranout",  "fies_hungry",  "fies_whlday"),
+    hdds    = c("dd_cereals", "dd_roots", "dd_vegetables", "dd_fruits",
+                "dd_meat", "dd_eggs", "dd_fish", "dd_legumes",
+                "dd_dairy", "dd_oils", "dd_sweets", "dd_condiments"),
+    soil    = c("soil_organic_matter", "soil_erosion", "soil_compaction",
+                "soil_water_retention", "soil_biodiversity"),
+    econ    = c("econ_situation", "econ_trend", "econ_cover_needs"),
+    tenure  = c("tenure_security", "tenure_formality", "tenure_access"),
+    aweai   = c("decisions_input", "decisions_food",
+                "access_land_w", "access_credit_w", "access_tech_w",
+                "control_income_w", "leadership_community_w",
+                "workload_balance_w"),
+    youth   = c("youth_involvement", "youth_succession",
+                "youth_training", "youth_access_land")
+  )
+
+  issues <- list()
+
+  for (grp in names(expected)) {
+    missing <- setdiff(expected[[grp]], names(df))
+    if (length(missing) > 0L) {
+      msg <- sprintf("[%s] Missing columns: %s", grp, paste(missing, collapse = ", "))
+      message("WARNING: ", msg)
+      issues[[grp]] <- missing
+    }
+  }
+
+  if (length(issues) == 0L) message("OK: No validation issues found.")
+  invisible(issues)
+}
+
+# =====================================================================
+# EXAMPLE / DEMO
+# =====================================================================
+if (FALSE) {
+
+  source("tape_caet_indicators.R")
+
+  df_raw <- read.csv("tape_export.csv", stringsAsFactors = FALSE)
+
+  # Validate
+  validate_performance_data(df_raw)
+
+  # Step 2: CAET scores
+  df_scored <- compute_caet(df_raw)
+
+  # Step 3: Performance indicators
+  df_scored <- compute_tape_performance(df_scored, crop_col_prefix = "crop_area_")
+
+  # Summary tables
+  caet_tbl <- caet_summary(df_scored, id_col = "_uuid")
+  perf_tbl <- tape_performance_summary(df_scored, id_col = "_uuid")
+
+  print(head(caet_tbl))
+  print(head(perf_tbl))
+
+  # Export
+  write.csv(df_scored, "tape_all_indicators.csv",      row.names = FALSE)
+  write.csv(caet_tbl,  "tape_caet_summary.csv",        row.names = FALSE)
+  write.csv(perf_tbl,  "tape_performance_summary.csv", row.names = FALSE)
+}
